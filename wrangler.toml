@@ -1,0 +1,12 @@
+# Cloudflare Workers / D1 configuration
+# Update these values for your Cloudflare account
+
+name = "genomile-scraper-api"
+compatibility_date = "2024-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "genome-web-scrape"
+database_id = "19d6c52c-e854-4f4b-bd38-ca1737e22f08"
+# To create: wrangler d1 create genomile-scraper
+# To migrate: wrangler d1 execute genomile-scraper --file=./d1_migration.sql
