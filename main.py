@@ -10,7 +10,7 @@ import os
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from contextlib import contextmanager
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -37,14 +37,30 @@ logger = logging.getLogger(__name__)
 # Load environment variables from .env for local development
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    # This makes local development easier but you should override in production
-    logging.warning(
-        "DATABASE_URL is not set, defaulting to local postgres database "
-        "'postgresql://postgres:postgres@localhost:5432/postgres'."
+_db_host = os.getenv("DB_HOST")
+_db_user = os.getenv("DB_USER")
+_db_password = os.getenv("DB_PASSWORD")
+
+if _db_host and _db_user and _db_password:
+    # Build DATABASE_URL from DB_* (e.g. AWS RDS); password is URL-encoded for special chars
+    _db_port = os.getenv("DB_PORT", "5432")
+    _db_name = os.getenv("DB_NAME", "postgres")
+    _password_encoded = quote_plus(_db_password)
+    DATABASE_URL = (
+        f"postgresql://{_db_user}:{_password_encoded}@{_db_host}:{_db_port}/{_db_name}?sslmode=require"
     )
-    DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/postgres"
+    logger.info("Using database from DB_HOST (AWS RDS): %s", _db_host)
+else:
+    DATABASE_URL = os.getenv("DATABASE_URL")
+    if not DATABASE_URL:
+        logging.warning(
+            "DATABASE_URL is not set, defaulting to local postgres database "
+            "'postgresql://postgres:postgres@localhost:5432/postgres'."
+        )
+        DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/postgres"
+    else:
+        if "render.com" in DATABASE_URL and "sslmode=" not in DATABASE_URL:
+            DATABASE_URL += "&sslmode=require" if "?" in DATABASE_URL else "?sslmode=require"
 
 
 SCHEMA_SQL = """
