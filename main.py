@@ -203,7 +203,9 @@ app.add_middleware(
 
 @app.on_event("startup")
 def on_startup():
+    logger.info("Connecting to database...")
     init_db()
+    logger.info("Application startup complete.")
 
 
 # ---------------------------------------------------------------------------
@@ -232,9 +234,10 @@ def scrape_sitemap(body: ScrapeRequest):
     urls_inserted = 0
     urls_skipped = 0
     now = datetime.now(timezone.utc).isoformat()
-
+    logger.info("Start saving in DB")
     with get_db() as conn:
         for entry in site_data:
+            logger.info("entry to save %s: ",entry)
             url = entry["url"]
             lastmod = entry["lastmod"]
             cat_name = categorise_url(url)
@@ -253,6 +256,7 @@ def scrape_sitemap(body: ScrapeRequest):
                 )
                 cat_id = cur.fetchone()["id"]
                 categories_created += 1
+                logger.info("Created category: %s", cat_name)
 
             # Insert URL (skip duplicates)
             try:
@@ -261,11 +265,14 @@ def scrape_sitemap(body: ScrapeRequest):
                     (url, cat_id, lastmod, now, now),
                 )
                 urls_inserted += 1
+                logger.debug("Inserted URL: %s", url)
             except psycopg.IntegrityError:
                 urls_skipped += 1
+                logger.debug("Skipped duplicate URL: %s", url)
 
     logger.info(
-        "Scrape complete — %d inserted, %d skipped, %d categories created",
+        "Saved scrape data to DB at %s — %d inserted, %d skipped, %d categories created",
+        now,
         urls_inserted,
         urls_skipped,
         categories_created,
