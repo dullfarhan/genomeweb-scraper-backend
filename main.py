@@ -1,19 +1,21 @@
 """
 Genomile Web Scraper — FastAPI Backend
 =======================================
-REST API for scraping sitemaps, storing URLs in SQLite (Cloudflare D1 compatible),
+REST API for scraping sitemaps, storing URLs in PostgreSQL via DATABASE_URL,
 and serving categorised URL data to the frontend.
 """
 
-import sqlite3
 import logging
+import os
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from contextlib import contextmanager
-from pathlib import Path
 from urllib.parse import urlparse
 from typing import Optional
 
+from dotenv import load_dotenv
+import psycopg
+from psycopg.rows import dict_row
 import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,24 +31,36 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Database
+# Database (PostgreSQL via DATABASE_URL)
 # ---------------------------------------------------------------------------
-DB_PATH = Path(__file__).parent / "scraper.db"
+
+# Load environment variables from .env for local development
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    # This makes local development easier but you should override in production
+    logging.warning(
+        "DATABASE_URL is not set, defaulting to local postgres database "
+        "'postgresql://postgres:postgres@localhost:5432/postgres'."
+    )
+    DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/postgres"
+
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS categories (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at TIMESTAMPTZ NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS urls (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     url TEXT NOT NULL UNIQUE,
     category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
     lastmod TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_urls_category_id ON urls(category_id);
@@ -55,12 +69,8 @@ CREATE INDEX IF NOT EXISTS idx_categories_name ON categories(name);
 """
 
 
-def _get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+def _get_connection() -> psycopg.Connection:
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 
 @contextmanager
@@ -78,13 +88,12 @@ def get_db():
 
 def init_db():
     with get_db() as conn:
-        conn.executescript(SCHEMA_SQL)
-        # Attempt to add lastmod column if it doesn't exist (migration for existing DBs)
-        try:
-            conn.execute("ALTER TABLE urls ADD COLUMN lastmod TEXT")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-    logger.info("Database initialised at %s", DB_PATH)
+        # Execute each statement separately for compatibility
+        for statement in SCHEMA_SQL.split(";"):
+            stmt = statement.strip()
+            if stmt:
+                conn.execute(stmt)
+    logger.info("Database initialised using PostgreSQL at %s", DATABASE_URL)
 
 
 # ---------------------------------------------------------------------------
@@ -232,26 +241,27 @@ def scrape_sitemap(body: ScrapeRequest):
 
             # Upsert category
             row = conn.execute(
-                "SELECT id FROM categories WHERE name = ?", (cat_name,)
+                "SELECT id FROM categories WHERE name = %s",
+                (cat_name,),
             ).fetchone()
             if row:
                 cat_id = row["id"]
             else:
                 cur = conn.execute(
-                    "INSERT INTO categories (name, created_at) VALUES (?, ?)",
+                    "INSERT INTO categories (name, created_at) VALUES (%s, %s) RETURNING id",
                     (cat_name, now),
                 )
-                cat_id = cur.lastrowid
+                cat_id = cur.fetchone()["id"]
                 categories_created += 1
 
             # Insert URL (skip duplicates)
             try:
                 conn.execute(
-                    "INSERT INTO urls (url, category_id, lastmod, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO urls (url, category_id, lastmod, created_at, updated_at) VALUES (%s, %s, %s, %s, %s)",
                     (url, cat_id, lastmod, now, now),
                 )
                 urls_inserted += 1
-            except sqlite3.IntegrityError:
+            except psycopg.IntegrityError:
                 urls_skipped += 1
 
     logger.info(
@@ -298,10 +308,10 @@ def list_urls(
     params: list = []
 
     if category:
-        conditions.append("c.name = ?")
+        conditions.append("c.name = %s")
         params.append(category)
     if search:
-        conditions.append("u.url LIKE ?")
+        conditions.append("u.url LIKE %s")
         params.append(f"%{search}%")
 
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
@@ -312,7 +322,7 @@ def list_urls(
         JOIN categories c ON c.id = u.category_id
         {where}
         ORDER BY u.id DESC
-        LIMIT ? OFFSET ?
+        LIMIT %s OFFSET %s
     """
     params.extend([limit, offset])
 
@@ -341,7 +351,7 @@ def get_url(url_id: int):
             SELECT u.id, u.url, c.name AS category, u.lastmod, u.created_at, u.updated_at
             FROM urls u
             JOIN categories c ON c.id = u.category_id
-            WHERE u.id = ?
+            WHERE u.id = %s
             """,
             (url_id,),
         ).fetchone()
@@ -365,7 +375,10 @@ def update_url(url_id: int, body: UrlUpdate):
     now = datetime.now(timezone.utc).isoformat()
 
     with get_db() as conn:
-        existing = conn.execute("SELECT * FROM urls WHERE id = ?", (url_id,)).fetchone()
+        existing = conn.execute(
+            "SELECT * FROM urls WHERE id = %s",
+            (url_id,),
+        ).fetchone()
         if not existing:
             raise HTTPException(status_code=404, detail="URL not found")
 
@@ -374,23 +387,24 @@ def update_url(url_id: int, body: UrlUpdate):
 
         if body.category:
             cat_row = conn.execute(
-                "SELECT id FROM categories WHERE name = ?", (body.category,)
+                "SELECT id FROM categories WHERE name = %s",
+                (body.category,),
             ).fetchone()
             if cat_row:
                 cat_id = cat_row["id"]
             else:
                 cur = conn.execute(
-                    "INSERT INTO categories (name, created_at) VALUES (?, ?)",
+                    "INSERT INTO categories (name, created_at) VALUES (%s, %s) RETURNING id",
                     (body.category, now),
                 )
-                cat_id = cur.lastrowid
+                cat_id = cur.fetchone()["id"]
 
         try:
             conn.execute(
-                "UPDATE urls SET url = ?, category_id = ?, updated_at = ? WHERE id = ?",
+                "UPDATE urls SET url = %s, category_id = %s, updated_at = %s WHERE id = %s",
                 (new_url, cat_id, now, url_id),
             )
-        except sqlite3.IntegrityError:
+        except psycopg.IntegrityError:
             raise HTTPException(status_code=409, detail="URL already exists")
 
         row = conn.execute(
@@ -398,7 +412,7 @@ def update_url(url_id: int, body: UrlUpdate):
             SELECT u.id, u.url, c.name AS category, u.lastmod, u.created_at, u.updated_at
             FROM urls u
             JOIN categories c ON c.id = u.category_id
-            WHERE u.id = ?
+            WHERE u.id = %s
             """,
             (url_id,),
         ).fetchone()
@@ -417,10 +431,16 @@ def update_url(url_id: int, body: UrlUpdate):
 def delete_url(url_id: int):
     """Delete a URL entry by ID."""
     with get_db() as conn:
-        existing = conn.execute("SELECT id FROM urls WHERE id = ?", (url_id,)).fetchone()
+        existing = conn.execute(
+            "SELECT id FROM urls WHERE id = %s",
+            (url_id,),
+        ).fetchone()
         if not existing:
             raise HTTPException(status_code=404, detail="URL not found")
-        conn.execute("DELETE FROM urls WHERE id = ?", (url_id,))
+        conn.execute(
+            "DELETE FROM urls WHERE id = %s",
+            (url_id,),
+        )
     return {"detail": "Deleted", "id": url_id}
 
 
