@@ -87,6 +87,18 @@ CREATE TABLE IF NOT EXISTS urls (
 CREATE INDEX IF NOT EXISTS idx_urls_category_id ON urls(category_id);
 CREATE INDEX IF NOT EXISTS idx_urls_url ON urls(url);
 CREATE INDEX IF NOT EXISTS idx_categories_name ON categories(name);
+
+CREATE TABLE IF NOT EXISTS articles (
+    id SERIAL PRIMARY KEY,
+    url_id INTEGER NOT NULL UNIQUE REFERENCES urls(id) ON DELETE CASCADE,
+    title TEXT,
+    author TEXT,
+    date_published TEXT,
+    content TEXT,
+    topics JSONB,
+    is_premium BOOLEAN DEFAULT FALSE,
+    scraped_at TIMESTAMPTZ NOT NULL
+);
 """
 
 # Connection pool: keeps connections alive and reuses them (fast, RDS-friendly)
@@ -152,6 +164,27 @@ class ScrapeResult(BaseModel):
 class DeleteAllResult(BaseModel):
     urls_deleted: int
     categories_deleted: int
+
+class ScrapeCategoryRequest(BaseModel):
+    category_name: str
+    limit: Optional[int] = None
+
+class ScrapeCategoryResult(BaseModel):
+    category_name: str
+    articles_scraped: int
+    errors: int
+    failed_urls: list[str] = []
+
+class ArticleOut(BaseModel):
+    id: int
+    url: str
+    title: Optional[str] = None
+    author: Optional[str] = None
+    date_published: Optional[str] = None
+    content: Optional[str] = None
+    topics: list[str] = []
+    is_premium: bool = False
+    scraped_at: str
 
 
 # ---------------------------------------------------------------------------
@@ -569,9 +602,11 @@ def get_grouped_data():
     with get_db() as conn:
         rows = conn.execute(
             """
-            SELECT c.name AS category, u.url, u.lastmod
+            SELECT c.name AS category, u.url, u.lastmod,
+                   CASE WHEN a.id IS NOT NULL THEN true ELSE false END AS is_scraped
             FROM urls u
             JOIN categories c ON c.id = u.category_id
+            LEFT JOIN articles a ON a.url_id = u.id
             ORDER BY c.name, u.id
             """
         ).fetchall()
@@ -579,7 +614,7 @@ def get_grouped_data():
     result: dict[str, list[dict[str, Optional[str]]]] = {}
     for r in rows:
         result.setdefault(r["category"], []).append(
-            {"url": r["url"], "lastmod": r["lastmod"]}
+            {"url": r["url"], "lastmod": r["lastmod"], "is_scraped": r["is_scraped"]}
         )
     return result
 
@@ -593,4 +628,211 @@ async def scrape_article(body: ArticleScrapeRequest):
         raise HTTPException(status_code=502, detail=result["error"])
     return result
 
+
+import json
+import asyncio
+import random
+
+@app.post("/api/scrape-category", response_model=ScrapeCategoryResult)
+async def scrape_category(body: ScrapeCategoryRequest):
+    """
+    Scrape all articles within a specific category and store them in the database.
+    """
+    logger.info("Starting scrape run for category: %s", body.category_name)
+    
+    with get_db() as conn:
+        # Fetch category id
+        cat_row = conn.execute("SELECT id FROM categories WHERE name = %s", (body.category_name,)).fetchone()
+        if not cat_row:
+            raise HTTPException(status_code=404, detail="Category not found")
+        
+        # Fetch URLs for this category
+        query = "SELECT id, url FROM urls WHERE category_id = %s ORDER BY id DESC"
+        params = [cat_row["id"]]
+        
+        if body.limit:
+            query += " LIMIT %s"
+            params.append(body.limit)
+            
+        urls = conn.execute(query, params).fetchall()
+
+    if not urls:
+        return ScrapeCategoryResult(category_name=body.category_name, articles_scraped=0, errors=0)
+
+    articles_scraped = 0
+    errors = 0
+    failed_urls = []
+    now = datetime.now(timezone.utc).isoformat()
+
+    for url_row in urls:
+        url_id = url_row["id"]
+        url_str = url_row["url"]
+        
+        try:
+            # Add delay to avoid hammering the server
+            delay = random.uniform(2, 3)
+            logger.info(f"Waiting {delay:.2f}s before scraping...")
+            await asyncio.sleep(delay)
+            
+            # Scrape content
+            result = await scrape_article_content(url_str)
+            if not result["success"]:
+                logger.warning("Failed to scrape URL %s: %s", url_str, result["error"])
+                errors += 1
+                failed_urls.append(url_str)
+                continue
+                
+            data = result["article_data"]
+            topics_json = json.dumps(data.get("topics", []))
+            
+            # Store in database
+            with get_db() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO articles (url_id, title, author, date_published, content, topics, is_premium, scraped_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (url_id) DO UPDATE SET
+                        title = EXCLUDED.title,
+                        author = EXCLUDED.author,
+                        date_published = EXCLUDED.date_published,
+                        content = EXCLUDED.content,
+                        topics = EXCLUDED.topics,
+                        is_premium = EXCLUDED.is_premium,
+                        scraped_at = EXCLUDED.scraped_at
+                    """,
+                    (
+                        url_id, 
+                        data.get("title"), 
+                        data.get("author"), 
+                        data.get("date"), 
+                        data.get("content"), 
+                        topics_json, 
+                        data.get("is_premium", False), 
+                        now
+                    )
+                )
+            logger.info("Successfully scraped and saved: %s", url_str)
+            articles_scraped += 1
+        except Exception as exc:
+            logger.error("Error processing URL %s: %s", url_str, exc)
+            errors += 1
+            failed_urls.append(url_str)
+
+    return ScrapeCategoryResult(
+        category_name=body.category_name,
+        articles_scraped=articles_scraped,
+        errors=errors,
+        failed_urls=failed_urls
+    )
+
+
+@app.delete("/api/scraped-articles/{category_name}")
+def delete_scraped_articles_for_category(category_name: str):
+    """Delete all scraped articles for a specific category."""
+    with get_db() as conn:
+        cat_row = conn.execute("SELECT id FROM categories WHERE name = %s", (category_name,)).fetchone()
+        if not cat_row:
+            raise HTTPException(status_code=404, detail="Category not found")
+            
+        cur = conn.execute(
+            """
+            WITH deleted AS (
+                DELETE FROM articles a
+                USING urls u
+                WHERE a.url_id = u.id AND u.category_id = %s
+                RETURNING a.id
+            )
+            SELECT COUNT(*) AS c FROM deleted
+            """,
+            (cat_row["id"],)
+        )
+        count = cur.fetchone()["c"]
+        
+    logger.warning("Deleted %d scraped articles for category %s", count, category_name)
+    return {"detail": f"Deleted scraped articles for {category_name}", "articles_deleted": count}
+
+@app.get("/api/scraped-articles", response_model=list[ArticleOut])
+def list_scraped_articles(
+    category: Optional[str] = Query(None, description="Filter by category name"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=500),
+):
+    """
+    List all scraped articles stored in the database.
+    """
+    offset = (page - 1) * limit
+    conditions = []
+    params = []
+
+    if category:
+        conditions.append("c.name = %s")
+        params.append(category)
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    query = f"""
+        SELECT 
+            a.id, u.url, a.title, a.author, a.date_published, 
+            a.content, a.topics, a.is_premium, a.scraped_at
+        FROM articles a
+        JOIN urls u ON a.url_id = u.id
+        JOIN categories c ON u.category_id = c.id
+        {where}
+        ORDER BY a.scraped_at DESC
+        LIMIT %s OFFSET %s
+    """
+    params.extend([limit, offset])
+
+    with get_db() as conn:
+        rows = conn.execute(query, params).fetchall()
+
+    result = []
+    for r in rows:
+        topics_list = []
+        if r["topics"]:
+            topics_list = r["topics"] if isinstance(r["topics"], list) else json.loads(r["topics"])
+            
+        result.append(ArticleOut(
+            id=r["id"],
+            url=r["url"],
+            title=r["title"],
+            author=r["author"],
+            date_published=r["date_published"],
+            content=r["content"],
+            topics=topics_list,
+            is_premium=r["is_premium"],
+            scraped_at=str(r["scraped_at"])
+        ))
+
+    return result
+
+
+@app.get("/api/scraped-article")
+def get_single_scraped_article(url: str):
+    """Fetch a single scraped article from the database by its URL."""
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT a.title, a.author, a.date_published, a.content, a.topics, a.is_premium
+            FROM articles a
+            JOIN urls u ON a.url_id = u.id
+            WHERE u.url = %s
+            """,
+            (url,)
+        ).fetchone()
+
+    if not row:
+        return {"success": False, "error": "Article not found in database. Scrape it first."}
+
+    article_data = {
+        "title": row["title"],
+        "date": row["date_published"],
+        "author": row["author"] or "",
+        "content": row["content"],
+        "topics": row["topics"] or [],
+        "is_premium": row["is_premium"],
+        "url": url,
+    }
+    
+    return {"success": True, "article_data": article_data}
 
