@@ -23,6 +23,9 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 
+from article_scraper import ArticleScrapeRequest, scrape_article_content
+
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -579,3 +582,15 @@ def get_grouped_data():
             {"url": r["url"], "lastmod": r["lastmod"]}
         )
     return result
+
+@app.post("/api/scrape-article")
+async def scrape_article(body: ArticleScrapeRequest):
+    """
+    Scrape the content of a specific article URL.
+    """
+    result = await scrape_article_content(body.url)
+    if not result["success"]:
+        raise HTTPException(status_code=502, detail=result["error"])
+    return result
+
+
