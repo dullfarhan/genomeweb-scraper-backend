@@ -7,6 +7,7 @@ and serving categorised URL data to the frontend.
 
 import logging
 import os
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from contextlib import contextmanager
@@ -16,6 +17,7 @@ from typing import Optional
 from dotenv import load_dotenv
 import psycopg
 from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -84,22 +86,20 @@ CREATE INDEX IF NOT EXISTS idx_urls_url ON urls(url);
 CREATE INDEX IF NOT EXISTS idx_categories_name ON categories(name);
 """
 
+# Connection pool: keeps connections alive and reuses them (fast, RDS-friendly)
+_pool: Optional[ConnectionPool] = None
 
-def _get_connection() -> psycopg.Connection:
-    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
+def _get_pool() -> ConnectionPool:
+    if _pool is None:
+        raise RuntimeError("Database pool not initialised (app not started?)")
+    return _pool
 
 
 @contextmanager
 def get_db():
-    conn = _get_connection()
-    try:
+    with _get_pool().connection() as conn:
         yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
 
 
 def init_db():
@@ -219,9 +219,27 @@ app.add_middleware(
 
 @app.on_event("startup")
 def on_startup():
-    logger.info("Connecting to database...")
+    global _pool
+    logger.info("Opening database connection pool (RDS)...")
+    _pool = ConnectionPool(
+        conninfo=DATABASE_URL,
+        kwargs={"row_factory": dict_row},
+        min_size=2,
+        max_size=20,
+        max_idle=600,
+        open=True,
+    )
     init_db()
     logger.info("Application startup complete.")
+
+
+@app.on_event("shutdown")
+def on_shutdown():
+    global _pool
+    if _pool is not None:
+        _pool.close()
+        _pool = None
+        logger.info("Database connection pool closed.")
 
 
 # ---------------------------------------------------------------------------
@@ -229,75 +247,133 @@ def on_startup():
 # ---------------------------------------------------------------------------
 
 
+def _build_category_to_entries(
+    site_data: list[dict[str, Optional[str]]],
+) -> dict[str, list[dict[str, Optional[str]]]]:
+    """Group scraped entries by category. Keys = category names, values = list of {url, lastmod}."""
+    by_category: dict[str, list[dict[str, Optional[str]]]] = {}
+    for entry in site_data:
+        cat_name = categorise_url(entry["url"])
+        by_category.setdefault(cat_name, []).append(
+            {"url": entry["url"], "lastmod": entry.get("lastmod")}
+        )
+    return by_category
+
+
 @app.post("/api/scrape", response_model=ScrapeResult)
 def scrape_sitemap(body: ScrapeRequest):
-    """Scrape a sitemap URL, categorise URLs, and store them in the DB."""
+    """Scrape a sitemap URL, categorise URLs, clear DB, then bulk-insert categories and URLs."""
+    t0 = time.perf_counter()
+    logger.info("[scrape] started at %s", datetime.now(timezone.utc).isoformat())
+
     try:
         sub_sitemaps = fetch_sitemap_urls(body.sitemap_url)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Failed to fetch sitemap index: {exc}")
 
-    site_data: list[dict[str, str]] = []
+    site_data: list[dict[str, Optional[str]]] = []
     for sm_url in sub_sitemaps:
         try:
             site_data.extend(fetch_site_urls_from_sub_sitemap(sm_url))
         except Exception as exc:
             logger.warning("Skipping sub-sitemap %s: %s", sm_url, exc)
 
-    logger.info("Collected %d site URLs total", len(site_data))
+    t_fetch = time.perf_counter() - t0
+    logger.info("[scrape] fetched %d URLs in %.2fs", len(site_data), t_fetch)
 
-    categories_created = 0
-    urls_inserted = 0
-    urls_skipped = 0
+    # Build dict: category_name -> [{"url", "lastmod"}, ...]
+    by_category = _build_category_to_entries(site_data)
+    category_names = sorted(by_category.keys())
+    categories_created = len(category_names)
     now = datetime.now(timezone.utc).isoformat()
-    logger.info("Start saving in DB")
+
     with get_db() as conn:
-        for entry in site_data:
-            logger.info("entry to save %s: ",entry)
-            url = entry["url"]
-            lastmod = entry["lastmod"]
-            cat_name = categorise_url(url)
+        # 1) Clear database first
+        conn.execute("DELETE FROM urls")
+        conn.execute("DELETE FROM categories")
+        logger.info("Cleared existing urls and categories")
 
-            # Upsert category
-            row = conn.execute(
-                "SELECT id FROM categories WHERE name = %s",
-                (cat_name,),
-            ).fetchone()
-            if row:
-                cat_id = row["id"]
-            else:
-                cur = conn.execute(
-                    "INSERT INTO categories (name, created_at) VALUES (%s, %s) RETURNING id",
-                    (cat_name, now),
-                )
-                cat_id = cur.fetchone()["id"]
-                categories_created += 1
-                logger.info("Created category: %s", cat_name)
+        if not category_names:
+            logger.info("No categories to insert")
+            return ScrapeResult(
+                categories_created=0,
+                urls_inserted=0,
+                urls_skipped=0,
+                total_urls_scraped=len(site_data),
+            )
 
-            # Insert URL (skip duplicates)
-            try:
-                conn.execute(
-                    "INSERT INTO urls (url, category_id, lastmod, created_at, updated_at) VALUES (%s, %s, %s, %s, %s)",
-                    (url, cat_id, lastmod, now, now),
-                )
-                urls_inserted += 1
-                logger.debug("Inserted URL: %s", url)
-            except psycopg.IntegrityError:
-                urls_skipped += 1
-                logger.debug("Skipped duplicate URL: %s", url)
+        # 2) Bulk insert all categories and get id per name
+        placeholders = ", ".join(
+            "(%s, %s)" for _ in category_names
+        )
+        params = []
+        for name in category_names:
+            params.extend([name, now])
+        rows = conn.execute(
+            f"INSERT INTO categories (name, created_at) VALUES {placeholders} RETURNING id, name",
+            params,
+        ).fetchall()
+        name_to_id = {r["name"]: r["id"] for r in rows}
 
+        # 3) Bulk insert all URLs — deduplicate by URL (sitemap can list same URL twice)
+        seen_urls: set[str] = set()
+        url_rows: list[tuple[str, int, Optional[str], str, str]] = []
+        for cat_name in category_names:
+            cat_id = name_to_id[cat_name]
+            for entry in by_category[cat_name]:
+                u = entry["url"]
+                if u not in seen_urls:
+                    seen_urls.add(u)
+                    url_rows.append((u, cat_id, entry.get("lastmod"), now, now))
+
+        urls_skipped_dupes = len(site_data) - len(url_rows)
+        if urls_skipped_dupes:
+            logger.info("[scrape] skipped %d duplicate URLs within sitemap", urls_skipped_dupes)
+
+        if not url_rows:
+            logger.info("No URLs to insert (all duplicates)")
+            return ScrapeResult(
+                categories_created=categories_created,
+                urls_inserted=0,
+                urls_skipped=urls_skipped_dupes,
+                total_urls_scraped=len(site_data),
+            )
+
+        # Insert in chunks to avoid huge single statement (e.g. 500 per batch)
+        BATCH_SIZE = 500
+        urls_inserted = 0
+        for i in range(0, len(url_rows), BATCH_SIZE):
+            batch = url_rows[i : i + BATCH_SIZE]
+            placeholders = ", ".join(
+                "(%s, %s, %s, %s, %s)" for _ in batch
+            )
+            params = []
+            for row in batch:
+                params.extend(row)
+            conn.execute(
+                f"""INSERT INTO urls (url, category_id, lastmod, created_at, updated_at)
+                    VALUES {placeholders}
+                    ON CONFLICT (url) DO NOTHING""",
+                params,
+            )
+            urls_inserted += len(batch)
+
+    t_total = time.perf_counter() - t0
+    t_db = t_total - t_fetch
     logger.info(
-        "Saved scrape data to DB at %s — %d inserted, %d skipped, %d categories created",
-        now,
-        urls_inserted,
-        urls_skipped,
+        "[scrape] finished at %s — %d categories, %d urls inserted (total: %d) | db: %.2fs | total: %.2fs",
+        datetime.now(timezone.utc).isoformat(),
         categories_created,
+        urls_inserted,
+        len(site_data),
+        t_db,
+        t_total,
     )
 
     return ScrapeResult(
         categories_created=categories_created,
         urls_inserted=urls_inserted,
-        urls_skipped=urls_skipped,
+        urls_skipped=urls_skipped_dupes,
         total_urls_scraped=len(site_data),
     )
 
@@ -497,7 +573,7 @@ def get_grouped_data():
             """
         ).fetchall()
 
-    result: dict[str, list[dict[str, str | None]]] = {}
+    result: dict[str, list[dict[str, Optional[str]]]] = {}
     for r in rows:
         result.setdefault(r["category"], []).append(
             {"url": r["url"], "lastmod": r["lastmod"]}
