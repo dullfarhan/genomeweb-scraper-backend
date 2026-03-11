@@ -1,6 +1,7 @@
 import asyncio
 from typing import Optional
 from playwright.async_api import async_playwright
+import playwright_stealth
 from pydantic import BaseModel
 
 class ArticleScrapeRequest(BaseModel):
@@ -12,13 +13,17 @@ async def scrape_article_content(url: str) -> dict:
     """
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        # Re-enabling JavaScript as the site might require it to render content
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            java_script_enabled=False,
-            viewport={'width': 1280, 'height': 800}
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            java_script_enabled=True,
+            viewport={"width": 1280, "height": 800},
         )
         page = await context.new_page()
+        await playwright_stealth.stealth_async(page)
         
         try:
             # Navigate to the URL and wait for network to settle
