@@ -1,17 +1,20 @@
 import asyncio
 from typing import Optional
 from playwright.async_api import async_playwright
-import playwright_stealth
+from playwright_stealth import Stealth
 from pydantic import BaseModel
+
 
 class ArticleScrapeRequest(BaseModel):
     url: str
 
+
 async def scrape_article_content(url: str) -> dict:
     """
-    Fetch and scrape a GenomeWeb article for its main content using Playwright.
+    Fetch and scrape a GenomeWeb article for its main content using Playwright + Stealth.
     """
-    async with async_playwright() as p:
+    # Use playwright-stealth recommended pattern so all pages are stealthified
+    async with Stealth().use_async(async_playwright()) as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
             user_agent=(
@@ -23,7 +26,6 @@ async def scrape_article_content(url: str) -> dict:
             viewport={"width": 1280, "height": 800},
         )
         page = await context.new_page()
-        await playwright_stealth.stealth_async(page)
         
         try:
             # Navigate to the URL and wait for network to settle
