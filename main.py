@@ -188,12 +188,29 @@ class ArticleOut(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Sitemap helpers (ported from original script)
+# HTTP / sitemap helpers
 # ---------------------------------------------------------------------------
+
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;"
+        "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+}
+
+
 def fetch_sitemap_urls(url: str) -> list[str]:
     """Fetch a sitemap index XML and return sub-sitemap <loc> URLs."""
     logger.info("Fetching sitemap index: %s", url)
-    response = requests.get(url, timeout=30)
+    response = requests.get(url, timeout=30, headers=_BROWSER_HEADERS)
     response.raise_for_status()
     root = ET.fromstring(response.content)
     ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
@@ -209,7 +226,7 @@ def fetch_sitemap_urls(url: str) -> list[str]:
 def fetch_site_urls_from_sub_sitemap(url: str) -> list[dict[str, str]]:
     """Fetch a sub-sitemap and return list of dicts with url and lastmod."""
     logger.info("Fetching sub-sitemap: %s", url)
-    response = requests.get(url, timeout=30)
+    response = requests.get(url, timeout=30, headers=_BROWSER_HEADERS)
     response.raise_for_status()
     root = ET.fromstring(response.content)
     ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
