@@ -202,17 +202,46 @@ _BROWSER_HEADERS = {
         "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
     ),
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": "gzip, deflate",
     "Connection": "keep-alive",
 }
+
+
+def _ensure_xml_response(url: str, response: requests.Response) -> ET.Element:
+    """
+    Make sure the response looks like XML and parse it.
+    Raises a clear error if the body is HTML or otherwise not XML.
+    """
+    # Basic content-type check
+    ctype = response.headers.get("Content-Type", "")
+    if "xml" not in ctype.lower():
+        snippet = response.text[:500].replace("\n", " ")
+        raise ValueError(
+            f"Expected XML from {url} but got Content-Type={ctype!r}. "
+            f"First 200 chars: {snippet[:200]!r}"
+        )
+
+    try:
+        return ET.fromstring(response.content)
+    except ET.ParseError as exc:
+        snippet = response.text[:500].replace("\n", " ")
+        raise ValueError(
+            f"Failed to parse XML from {url}: {exc}. "
+            f"First 200 chars: {snippet[:200]!r}"
+        ) from exc
 
 
 def fetch_sitemap_urls(url: str) -> list[str]:
     """Fetch a sitemap index XML and return sub-sitemap <loc> URLs."""
     logger.info("Fetching sitemap index: %s", url)
-    response = requests.get(url, timeout=30, headers=_BROWSER_HEADERS)
-    response.raise_for_status()
-    root = ET.fromstring(response.content)
+    try:
+        response = requests.get(url, timeout=30, headers=_BROWSER_HEADERS)
+        response.raise_for_status()
+    except Exception as exc:
+        logger.error("Error fetching sitemap index %s: %s", url, exc)
+        raise
+
+    root = _ensure_xml_response(url, response)
     ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
     urls = [
         loc.text.strip()
@@ -226,9 +255,14 @@ def fetch_sitemap_urls(url: str) -> list[str]:
 def fetch_site_urls_from_sub_sitemap(url: str) -> list[dict[str, str]]:
     """Fetch a sub-sitemap and return list of dicts with url and lastmod."""
     logger.info("Fetching sub-sitemap: %s", url)
-    response = requests.get(url, timeout=30, headers=_BROWSER_HEADERS)
-    response.raise_for_status()
-    root = ET.fromstring(response.content)
+    try:
+        response = requests.get(url, timeout=30, headers=_BROWSER_HEADERS)
+        response.raise_for_status()
+    except Exception as exc:
+        logger.warning("Error fetching sub-sitemap %s: %s", url, exc)
+        raise
+
+    root = _ensure_xml_response(url, response)
     ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
     
     results = []
@@ -322,7 +356,11 @@ def scrape_sitemap(body: ScrapeRequest):
     try:
         sub_sitemaps = fetch_sitemap_urls(body.sitemap_url)
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch sitemap index: {exc}")
+        logger.error("Failed to fetch sitemap index %s: %s", body.sitemap_url, exc)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to fetch sitemap index. The server may be blocking the scraper or returning non-XML content. Root cause: {exc}",
+        )
 
     site_data: list[dict[str, Optional[str]]] = []
     for sm_url in sub_sitemaps:
