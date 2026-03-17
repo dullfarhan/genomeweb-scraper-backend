@@ -19,11 +19,13 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 import requests
+from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
+from playwright.async_api import async_playwright
 
-from article_scraper import ArticleScrapeRequest, scrape_article_content
+from article_scraper import ArticleScrapeRequest, scrape_article_content, ZENROWS_WS_URL
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +100,14 @@ CREATE TABLE IF NOT EXISTS articles (
     topics JSONB,
     is_premium BOOLEAN DEFAULT FALSE,
     scraped_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS breaking_news_urls (
+    id SERIAL PRIMARY KEY,
+    url TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    ui_date TEXT,
+    created_at TIMESTAMPTZ NOT NULL
 );
 """
 
@@ -187,61 +197,23 @@ class ArticleOut(BaseModel):
     scraped_at: str
 
 
+class BreakingNewsUrlOut(BaseModel):
+    id: int
+    url: str
+    title: str
+    ui_date: Optional[str] = None
+    created_at: str
+
+
 # ---------------------------------------------------------------------------
-# HTTP / sitemap helpers
+# Sitemap helpers (ported from original script)
 # ---------------------------------------------------------------------------
-
-_BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;"
-        "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    # "Accept-Encoding": "gzip, deflate",
-    "Connection": "keep-alive",
-}
-
-
-def _ensure_xml_response(url: str, response: requests.Response) -> ET.Element:
-    """
-    Make sure the response looks like XML and parse it.
-    Raises a clear error if the body is HTML or otherwise not XML.
-    """
-    # Basic content-type check
-    ctype = response.headers.get("Content-Type", "")
-    if "xml" not in ctype.lower():
-        snippet = response.text[:500].replace("\n", " ")
-        raise ValueError(
-            f"Expected XML from {url} but got Content-Type={ctype!r}. "
-            f"First 200 chars: {snippet[:200]!r}"
-        )
-
-    try:
-        return ET.fromstring(response.content)
-    except ET.ParseError as exc:
-        snippet = response.text[:500].replace("\n", " ")
-        raise ValueError(
-            f"Failed to parse XML from {url}: {exc}. "
-            f"First 200 chars: {snippet[:200]!r}"
-        ) from exc
-
-
 def fetch_sitemap_urls(url: str) -> list[str]:
     """Fetch a sitemap index XML and return sub-sitemap <loc> URLs."""
     logger.info("Fetching sitemap index: %s", url)
-    try:
-        response = requests.get(url, timeout=30, headers=_BROWSER_HEADERS)
-        response.raise_for_status()
-    except Exception as exc:
-        logger.error("Error fetching sitemap index %s: %s", url, exc)
-        raise
-
-    root = _ensure_xml_response(url, response)
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+    root = ET.fromstring(response.content)
     ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
     urls = [
         loc.text.strip()
@@ -255,14 +227,9 @@ def fetch_sitemap_urls(url: str) -> list[str]:
 def fetch_site_urls_from_sub_sitemap(url: str) -> list[dict[str, str]]:
     """Fetch a sub-sitemap and return list of dicts with url and lastmod."""
     logger.info("Fetching sub-sitemap: %s", url)
-    try:
-        response = requests.get(url, timeout=30, headers=_BROWSER_HEADERS)
-        response.raise_for_status()
-    except Exception as exc:
-        logger.warning("Error fetching sub-sitemap %s: %s", url, exc)
-        raise
-
-    root = _ensure_xml_response(url, response)
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+    root = ET.fromstring(response.content)
     ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
     
     results = []
@@ -356,11 +323,7 @@ def scrape_sitemap(body: ScrapeRequest):
     try:
         sub_sitemaps = fetch_sitemap_urls(body.sitemap_url)
     except Exception as exc:
-        logger.error("Failed to fetch sitemap index %s: %s", body.sitemap_url, exc)
-        raise HTTPException(
-            status_code=502,
-            detail=f"Failed to fetch sitemap index. The server may be blocking the scraper or returning non-XML content. Root cause: {exc}",
-        )
+        raise HTTPException(status_code=502, detail=f"Failed to fetch sitemap index: {exc}")
 
     site_data: list[dict[str, Optional[str]]] = []
     for sm_url in sub_sitemaps:
@@ -467,6 +430,70 @@ def scrape_sitemap(body: ScrapeRequest):
         urls_skipped=urls_skipped_dupes,
         total_urls_scraped=len(site_data),
     )
+
+
+async def _fetch_breaking_news_cards() -> list[dict[str, str]]:
+    """
+    Fetch the breaking news listing page via ZenRows + Playwright and return a list of
+    {url, title, ui_date} dictionaries for each article card.
+    Falls back to a direct requests-based scrape if ZENROWS_WS_URL is not configured.
+    """
+    listing_url = "https://www.genomeweb.com/breaking-news"
+    logger.info("Fetching breaking news listing: %s", listing_url)
+
+    # If ZenRows is not configured, fall back to a simple requests scrape.
+    if not ZENROWS_WS_URL:
+        resp = requests.get(listing_url, timeout=30)
+        resp.raise_for_status()
+        html_content = resp.text
+    else:
+        async with async_playwright() as p:
+            browser = await p.chromium.connect_over_cdp(ZENROWS_WS_URL)
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                java_script_enabled=False,
+                viewport={"width": 1280, "height": 800},
+            )
+            page = await context.new_page()
+            try:
+                await page.goto(listing_url, wait_until="networkidle", timeout=60000)
+                html_content = await page.content()
+            finally:
+                await browser.close()
+
+    soup = BeautifulSoup(html_content, "html.parser")
+    cards = soup.select('div.card__list.views-row[data-content-type="article"]')
+
+    results: list[dict[str, str]] = []
+    for card in cards:
+        heading_link = card.select_one("h2.card__heading a.card__heading-link")
+        time_el = card.select_one("div.card__date time")
+
+        if not heading_link or not heading_link.get("href"):
+            continue
+
+        href = heading_link.get("href", "").strip()
+        if not href:
+            continue
+
+        if href.startswith("http"):
+            full_url = href
+        else:
+            full_url = f"https://www.genomeweb.com{href}"
+
+        title = heading_link.get_text(strip=True)
+        ui_date = time_el.get_text(strip=True) if time_el else None
+
+        results.append(
+            {
+                "url": full_url,
+                "title": title,
+                "ui_date": ui_date or "",
+            }
+        )
+
+    logger.info("Found %d breaking news article cards", len(results))
+    return results
 
 
 @app.get("/api/categories", response_model=list[CategoryOut])
@@ -682,6 +709,68 @@ async def scrape_article(body: ArticleScrapeRequest):
     if not result["success"]:
         raise HTTPException(status_code=502, detail=result["error"])
     return result
+
+
+@app.post("/api/breaking-news-urls/refresh")
+async def refresh_breaking_news_urls():
+    """
+    Scrape the GenomeWeb breaking news listing page and upsert
+    any new article URLs into the breaking_news_urls table.
+    Existing URLs are left untouched.
+    """
+    cards = await _fetch_breaking_news_cards()
+    if not cards:
+        return {"inserted": 0, "total_cards": 0}
+
+    now = datetime.now(timezone.utc).isoformat()
+    inserted = 0
+
+    with get_db() as conn:
+        for item in cards:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO breaking_news_urls (url, title, ui_date, created_at)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (url) DO NOTHING
+                    """,
+                    (item["url"], item["title"], item["ui_date"], now),
+                )
+                inserted += 1
+            except Exception as exc:
+                logger.warning(
+                    "Failed to insert breaking news URL %s: %s",
+                    item["url"],
+                    exc,
+                )
+
+    return {"inserted": inserted, "total_cards": len(cards)}
+
+
+@app.get("/api/breaking-news-urls", response_model=list[BreakingNewsUrlOut])
+def list_breaking_news_urls():
+    """
+    List all stored breaking news URLs, ordered by most recent first.
+    """
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, url, title, ui_date, created_at
+            FROM breaking_news_urls
+            ORDER BY created_at DESC, id DESC
+            """
+        ).fetchall()
+
+    return [
+        BreakingNewsUrlOut(
+            id=r["id"],
+            url=r["url"],
+            title=r["title"],
+            ui_date=r["ui_date"],
+            created_at=str(r["created_at"]),
+        )
+        for r in rows
+    ]
 
 
 import json

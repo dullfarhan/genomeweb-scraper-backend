@@ -33,7 +33,7 @@ async def scrape_article_content(url: str) -> dict:
         browser = await p.chromium.connect_over_cdp(ZENROWS_WS_URL)
 
         # In CDP mode, contexts may be pre-created
-         # Re-enabling JavaScript as the site might require it to render content
+        # Re-enabling JavaScript as the site might require it to render content
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             java_script_enabled=False,
@@ -44,7 +44,16 @@ async def scrape_article_content(url: str) -> dict:
 
         try:
             # Navigate to the URL and wait for network to settle
-            await page.goto(url, wait_until="networkidle", timeout=60000)
+            response = await page.goto(url, wait_until="networkidle", timeout=60000)
+
+            # Estimate data transfer for this main request
+            bytes_transferred = 0
+            if response is not None:
+                try:
+                    body_bytes = await response.body()
+                    bytes_transferred = len(body_bytes)
+                except Exception:
+                    bytes_transferred = 0
 
             # Check for bot block or empty page
             page_title = await page.title()
@@ -127,11 +136,12 @@ async def scrape_article_content(url: str) -> dict:
                 "is_premium": is_premium,
             }
 
-            # Debugging print
+            # Debugging print including approximate data transfer usage
             print(
                 f"Scraped {url}: Title='{article_data['title']}', "
                 f"Content Length={len(article_data['content'])}, "
-                f"Topics={len(article_data['topics'])}, Premium={article_data['is_premium']}"
+                f"Topics={len(article_data['topics'])}, Premium={article_data['is_premium']}, "
+                f"Main response size={bytes_transferred} bytes (~{bytes_transferred / 1024:.1f} KB)"
             )
 
             await browser.close()
@@ -143,6 +153,7 @@ async def scrape_article_content(url: str) -> dict:
                 "success": True,
                 "url": url,
                 "article_data": article_data,
+                "bytes_transferred": bytes_transferred,
                 "error": None,
             }
 
